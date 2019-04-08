@@ -12,6 +12,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -34,6 +35,7 @@ import org.redisson.RedisRunner;
 import org.redisson.RedisRunner.FailedToStartRedisException;
 import org.redisson.RedisRunner.RedisProcess;
 import org.redisson.client.codec.JsonJacksonMapCodec;
+import org.redisson.codec.TypedJsonJacksonCodec;
 import org.redisson.config.Config;
 import org.redisson.jcache.configuration.RedissonConfiguration;
 
@@ -42,6 +44,65 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 public class JCacheTest extends BaseTest {
 
+    @Test
+    public void testRemoveAll() throws Exception {
+        RedisProcess runner = new RedisRunner()
+                .nosave()
+                .randomDir()
+                .port(6311)
+                .run();
+        
+        URL configUrl = getClass().getResource("redisson-jcache.json");
+        Config cfg = Config.fromJSON(configUrl);
+        
+        Configuration<String, String> config = RedissonConfiguration.fromConfig(cfg);
+        Cache<String, String> cache = Caching.getCachingProvider().getCacheManager()
+                .createCache("test", config);
+        
+        cache.put("1", "2");
+        cache.put("3", "4");
+        cache.put("4", "4");
+        cache.put("5", "5");
+        
+        Set<? extends String> keys = new HashSet<String>(Arrays.asList("1", "3", "4", "5"));
+        cache.removeAll(keys);
+        assertThat(cache.containsKey("1")).isFalse();
+        assertThat(cache.containsKey("3")).isFalse();
+        assertThat(cache.containsKey("4")).isFalse();
+        assertThat(cache.containsKey("5")).isFalse();
+        
+        cache.close();
+        runner.stop();
+    }
+
+    @Test
+    public void testGetAllHighVolume() throws Exception {
+        RedisProcess runner = new RedisRunner()
+                .nosave()
+                .randomDir()
+                .port(6311)
+                .run();
+        
+        URL configUrl = getClass().getResource("redisson-jcache.json");
+        Config cfg = Config.fromJSON(configUrl);
+        
+        Configuration<String, String> config = RedissonConfiguration.fromConfig(cfg);
+        Cache<String, String> cache = Caching.getCachingProvider().getCacheManager()
+                .createCache("test", config);
+
+        Map<String, String> m = new HashMap<>();
+        for (int i = 0; i < 10000; i++) {
+            m.put("" + i, "" + i);
+        }
+        cache.putAll(m);
+        
+        Map<String, String> entries = cache.getAll(m.keySet());
+        assertThat(entries).isEqualTo(m);
+        
+        cache.close();
+        runner.stop();
+    }
+    
     @Test
     public void testGetAll() throws Exception {
         RedisProcess runner = new RedisRunner()
@@ -52,7 +113,6 @@ public class JCacheTest extends BaseTest {
         
         URL configUrl = getClass().getResource("redisson-jcache.json");
         Config cfg = Config.fromJSON(configUrl);
-        cfg.useSingleServer().setTimeout(300000);
         
         Configuration<String, String> config = RedissonConfiguration.fromConfig(cfg);
         Cache<String, String> cache = Caching.getCachingProvider().getCacheManager()
@@ -83,7 +143,7 @@ public class JCacheTest extends BaseTest {
         Config cfg = Config.fromJSON(configUrl);
         ObjectMapper objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
-        cfg.setCodec(new JsonJacksonMapCodec(String.class, LocalDateTime.class, objectMapper));
+        cfg.setCodec(new TypedJsonJacksonCodec(String.class, LocalDateTime.class, objectMapper));
         
         Configuration<String, LocalDateTime> config = RedissonConfiguration.fromConfig(cfg);
         Cache<String, LocalDateTime> cache = Caching.getCachingProvider().getCacheManager()

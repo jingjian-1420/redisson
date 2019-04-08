@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,21 +36,21 @@ public class MapCachePutIfAbsentOperation extends MapOperation {
     }
     
     public MapCachePutIfAbsentOperation(RMap<?, ?> map, Object key, Object value, 
-            long ttl, TimeUnit unit, long maxIdleTime, TimeUnit maxIdleUnit) {
-        this(map, key, value);
+            long ttl, TimeUnit unit, long maxIdleTime, TimeUnit maxIdleUnit, String transactionId) {
+        this(map, key, value, transactionId);
         this.ttl = ttl;
         this.unit = unit;
         this.maxIdleTime = maxIdleTime;
         this.maxIdleUnit = maxIdleUnit;
     }
     
-    public MapCachePutIfAbsentOperation(RMap<?, ?> map, Object key, Object value) {
-        super(map, key, value);
+    public MapCachePutIfAbsentOperation(RMap<?, ?> map, Object key, Object value, String transactionId) {
+        super(map, key, value, transactionId);
     }
 
     @Override
     public void commit(RMap<Object, Object> map) {
-        ((RMapCache<Object, Object>)map).putIfAbsentAsync(key, value, ttl, unit, maxIdleTime, maxIdleUnit);
+        ((RMapCache<Object, Object>) map).putIfAbsentAsync(key, value, ttl, unit, maxIdleTime, maxIdleUnit);
     }
     
     public long getTTL() {

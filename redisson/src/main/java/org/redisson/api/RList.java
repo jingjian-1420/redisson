@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ public interface RList<V> extends List<V>, RExpirable, RListAsync<V>, RSortable<
      * @param indexes of elements
      * @return list of elements
      */
-    List<V> get(int ...indexes);
+    List<V> get(int...indexes);
     
     /**
      * Returns <code>RMapReduce</code> object associated with this map
@@ -85,7 +85,7 @@ public interface RList<V> extends List<V>, RExpirable, RListAsync<V>, RSortable<
 
     /**
      * Trim list and remains elements only in specified range
-     * <tt>fromIndex</tt>, inclusive, and <tt>toIndex</tt>, inclusive.
+     * <code>fromIndex</code>, inclusive, and <code>toIndex</code>, inclusive.
      *
      * @param fromIndex - from index
      * @param toIndex - to index
@@ -98,5 +98,15 @@ public interface RList<V> extends List<V>, RExpirable, RListAsync<V>, RSortable<
      * @param index - index of object
      */
     void fastRemove(int index);
+    
+    /**
+     * Removes up to <code>count</code> occurrences of <code>element</code> 
+     * 
+     * @param element - element to find
+     * @param count - amount occurrences
+     * @return {@code true} if at least one element removed; 
+     *      or {@code false} if element isn't found
+     */
+    boolean remove(Object element, int count);
     
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,15 @@
 package org.redisson.codec;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 
 import org.nustaq.serialization.FSTConfiguration;
+import org.nustaq.serialization.FSTDecoder;
+import org.nustaq.serialization.FSTEncoder;
 import org.nustaq.serialization.FSTObjectInput;
 import org.nustaq.serialization.FSTObjectOutput;
+import org.nustaq.serialization.coders.FSTStreamDecoder;
+import org.nustaq.serialization.coders.FSTStreamEncoder;
 import org.redisson.client.codec.BaseCodec;
 import org.redisson.client.handler.State;
 import org.redisson.client.protocol.Decoder;
@@ -41,6 +46,74 @@ import io.netty.buffer.ByteBufOutputStream;
  */
 public class FstCodec extends BaseCodec {
 
+    static class FSTDefaultStreamCoderFactory implements FSTConfiguration.StreamCoderFactory {
+
+        Field chBufField;
+        Field ascStringCacheField;
+
+        {
+            try {
+                chBufField = FSTStreamDecoder.class.getDeclaredField("chBufS");
+                ascStringCacheField = FSTStreamDecoder.class.getDeclaredField("ascStringCache");
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+            ascStringCacheField.setAccessible(true);
+            chBufField.setAccessible(true);
+        }
+        
+        private FSTConfiguration fstConfiguration;
+
+        FSTDefaultStreamCoderFactory(FSTConfiguration fstConfiguration) {
+            this.fstConfiguration = fstConfiguration;
+        }
+
+        @Override
+        public FSTEncoder createStreamEncoder() {
+            return new FSTStreamEncoder(fstConfiguration);
+        }
+
+        @Override
+        public FSTDecoder createStreamDecoder() {
+            return new FSTStreamDecoder(fstConfiguration) {
+                public String readStringUTF() throws IOException {
+                    try {
+                        String res = super.readStringUTF();
+                        chBufField.set(this, null);
+                        return res;
+                    } catch (Exception e) {
+                        throw new IOException(e);
+                    }
+                }
+                
+                @Override
+                public String readStringAsc() throws IOException {
+                    try {
+                        String res = super.readStringAsc();
+                        ascStringCacheField.set(this, null);
+                        return res;
+                    } catch (Exception e) {
+                        throw new IOException(e);
+                    }
+                }
+            };
+        }
+
+        static ThreadLocal input = new ThreadLocal();
+        static ThreadLocal output = new ThreadLocal();
+
+        @Override
+        public ThreadLocal getInput() {
+            return input;
+        }
+
+        @Override
+        public ThreadLocal getOutput() {
+            return output;
+        }
+
+    }
+    
     private final FSTConfiguration config;
 
     public FstCodec() {
@@ -50,7 +123,27 @@ public class FstCodec extends BaseCodec {
     public FstCodec(ClassLoader classLoader) {
         this(createConfig(classLoader));
     }
+    
+    public FstCodec(ClassLoader classLoader, FstCodec codec) {
+        this(copy(classLoader, codec));
+    }
 
+    private static FSTConfiguration copy(ClassLoader classLoader, FstCodec codec) {
+        FSTConfiguration def = FSTConfiguration.createDefaultConfiguration();
+        def.setClassLoader(classLoader);
+        def.setCoderSpecific(codec.config.getCoderSpecific());
+        def.setCrossPlatform(codec.config.isCrossPlatform());
+        def.setForceClzInit(codec.config.isForceClzInit());
+        def.setForceSerializable(codec.config.isForceSerializable());
+        def.setInstantiator(codec.config.getInstantiator(null));
+        def.setName(codec.config.getName());
+        def.setPreferSpeed(codec.config.isPreferSpeed());
+        def.setShareReferences(codec.config.isShareReferences());
+        def.setStreamCoderFactory(codec.config.getStreamCoderFactory());
+        def.setVerifier(codec.config.getVerifier());
+        return def;
+    }
+    
     private static FSTConfiguration createConfig(ClassLoader classLoader) {
         FSTConfiguration def = FSTConfiguration.createDefaultConfiguration();
         def.setClassLoader(classLoader);
@@ -59,19 +152,22 @@ public class FstCodec extends BaseCodec {
 
     public FstCodec(FSTConfiguration fstConfiguration) {
         config = fstConfiguration;
+        config.setStreamCoderFactory(new FSTDefaultStreamCoderFactory(config));
     }
 
     private final Decoder<Object> decoder = new Decoder<Object>() {
         @Override
         public Object decode(ByteBuf buf, State state) throws IOException {
+            ByteBufInputStream in = new ByteBufInputStream(buf);
+            FSTObjectInput inputStream = config.getObjectInput(in);
             try {
-                ByteBufInputStream in = new ByteBufInputStream(buf);
-                FSTObjectInput inputStream = config.getObjectInput(in);
                 return inputStream.readObject();
             } catch (IOException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
+//            } finally {
+//                inputStream.resetForReuseUseArray(empty);
             }
         }
     };
@@ -81,9 +177,9 @@ public class FstCodec extends BaseCodec {
         @Override
         public ByteBuf encode(Object in) throws IOException {
             ByteBuf out = ByteBufAllocator.DEFAULT.buffer();
+            ByteBufOutputStream os = new ByteBufOutputStream(out);
+            FSTObjectOutput oos = config.getObjectOutput(os);
             try {
-                ByteBufOutputStream os = new ByteBufOutputStream(out);
-                FSTObjectOutput oos = config.getObjectOutput(os);
                 oos.writeObject(in);
                 oos.flush();
                 return os.buffer();
@@ -93,6 +189,8 @@ public class FstCodec extends BaseCodec {
             } catch (Exception e) {
                 out.release();
                 throw new IOException(e);
+//            } finally {
+//                oos.resetForReUse(empty);
             }
         }
     };

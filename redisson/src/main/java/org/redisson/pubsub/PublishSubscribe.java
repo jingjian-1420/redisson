@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,21 +15,20 @@
  */
 package org.redisson.pubsub;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.redisson.PubSubEntry;
 import org.redisson.api.RFuture;
 import org.redisson.client.BaseRedisPubSubListener;
+import org.redisson.client.ChannelName;
 import org.redisson.client.RedisPubSubListener;
 import org.redisson.client.codec.LongCodec;
 import org.redisson.client.protocol.pubsub.PubSubType;
-import org.redisson.connection.ConnectionManager;
 import org.redisson.misc.RPromise;
 import org.redisson.misc.RedissonPromise;
 import org.redisson.misc.TransferListener;
-
-import io.netty.util.internal.PlatformDependent;
 
 /**
  * 
@@ -38,10 +37,17 @@ import io.netty.util.internal.PlatformDependent;
  */
 abstract class PublishSubscribe<E extends PubSubEntry<E>> {
 
-    private final ConcurrentMap<String, E> entries = PlatformDependent.newConcurrentHashMap();
+    private final PublishSubscribeService service;
+    
+    PublishSubscribe(PublishSubscribeService service) {
+        super();
+        this.service = service;
+    }
 
-    public void unsubscribe(final E entry, final String entryName, final String channelName, final PublishSubscribeService subscribeService) {
-        final AsyncSemaphore semaphore = subscribeService.getSemaphore(channelName);
+    private final ConcurrentMap<String, E> entries = new ConcurrentHashMap<>();
+
+    public void unsubscribe(E entry, String entryName, String channelName) {
+        AsyncSemaphore semaphore = service.getSemaphore(new ChannelName(channelName));
         semaphore.acquire(new Runnable() {
             @Override
             public void run() {
@@ -51,7 +57,7 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                     if (!removed) {
                         throw new IllegalStateException();
                     }
-                    subscribeService.unsubscribe(channelName, semaphore);
+                    service.unsubscribe(new ChannelName(channelName), semaphore);
                 } else {
                     semaphore.release();
                 }
@@ -64,10 +70,10 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
         return entries.get(entryName);
     }
 
-    public RFuture<E> subscribe(final String entryName, final String channelName, final PublishSubscribeService subscribeService) {
-        final AtomicReference<Runnable> listenerHolder = new AtomicReference<Runnable>();
-        final AsyncSemaphore semaphore = subscribeService.getSemaphore(channelName);
-        final RPromise<E> newPromise = new RedissonPromise<E>() {
+    public RFuture<E> subscribe(String entryName, String channelName) {
+        AtomicReference<Runnable> listenerHolder = new AtomicReference<Runnable>();
+        AsyncSemaphore semaphore = service.getSemaphore(new ChannelName(channelName));
+        RPromise<E> newPromise = new RedissonPromise<E>() {
             @Override
             public boolean cancel(boolean mayInterruptIfRunning) {
                 return semaphore.remove(listenerHolder.get());
@@ -82,7 +88,7 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 if (entry != null) {
                     entry.aquire();
                     semaphore.release();
-                    entry.getPromise().addListener(new TransferListener<E>(newPromise));
+                    entry.getPromise().onComplete(new TransferListener<E>(newPromise));
                     return;
                 }
                 
@@ -93,12 +99,12 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 if (oldValue != null) {
                     oldValue.aquire();
                     semaphore.release();
-                    oldValue.getPromise().addListener(new TransferListener<E>(newPromise));
+                    oldValue.getPromise().onComplete(new TransferListener<E>(newPromise));
                     return;
                 }
                 
                 RedisPubSubListener<Object> listener = createListener(channelName, value);
-                subscribeService.subscribe(LongCodec.INSTANCE, channelName, semaphore, listener);
+                service.subscribe(LongCodec.INSTANCE, channelName, semaphore, listener);
             }
         };
         semaphore.acquire(listener);
@@ -111,21 +117,21 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
 
     protected abstract void onMessage(E value, Long message);
 
-    private RedisPubSubListener<Object> createListener(final String channelName, final E value) {
+    private RedisPubSubListener<Object> createListener(String channelName, E value) {
         RedisPubSubListener<Object> listener = new BaseRedisPubSubListener() {
 
             @Override
-            public void onMessage(String channel, Object message) {
-                if (!channelName.equals(channel)) {
+            public void onMessage(CharSequence channel, Object message) {
+                if (!channelName.equals(channel.toString())) {
                     return;
                 }
 
-                PublishSubscribe.this.onMessage(value, (Long)message);
+                PublishSubscribe.this.onMessage(value, (Long) message);
             }
 
             @Override
-            public boolean onStatus(PubSubType type, String channel) {
-                if (!channelName.equals(channel)) {
+            public boolean onStatus(PubSubType type, CharSequence channel) {
+                if (!channelName.equals(channel.toString())) {
                     return false;
                 }
 

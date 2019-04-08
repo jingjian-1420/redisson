@@ -1,5 +1,5 @@
 /**
- * Copyright 2018 Nikita Koksharov
+ * Copyright (c) 2013-2019 Nikita Koksharov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package org.redisson.executor;
 
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.redisson.RedissonExecutorService;
 import org.redisson.api.RFuture;
@@ -26,11 +27,12 @@ import org.redisson.client.codec.LongCodec;
 import org.redisson.client.codec.StringCodec;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.command.CommandExecutor;
+import org.redisson.executor.params.ScheduledParameters;
+import org.redisson.misc.RPromise;
+import org.redisson.remote.RRemoteServiceResponse;
 import org.redisson.remote.RemoteServiceRequest;
 import org.redisson.remote.RequestId;
 import org.redisson.remote.ResponseEntry;
-
-import io.netty.util.internal.PlatformDependent;
 
 /**
  * 
@@ -51,30 +53,19 @@ public class ScheduledTasksService extends TasksService {
     
     @Override
     protected RFuture<Boolean> addAsync(String requestQueueName, RemoteServiceRequest request) {
-        int requestIndex = 0;
-        if ("scheduleCallable".equals(request.getMethodName())
-                || "scheduleRunnable".equals(request.getMethodName())) {
-            requestIndex = 4;
-        }
-        if ("scheduleAtFixedRate".equals(request.getMethodName())
-                || "scheduleWithFixedDelay".equals(request.getMethodName())
-                    || "schedule".equals(request.getMethodName())) {
-            requestIndex = 6;
-        }
-
-        request.getArgs()[requestIndex] = request.getId();
-        Long startTime = (Long)request.getArgs()[3];
+        ScheduledParameters params = (ScheduledParameters) request.getArgs()[0];
+        params.setRequestId(request.getId());
         
         return commandExecutor.evalWriteAsync(name, LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 // check if executor service not in shutdown state
                 "if redis.call('exists', KEYS[2]) == 0 then "
                     + "local retryInterval = redis.call('get', KEYS[6]); "
                     + "if retryInterval ~= false then "
-                        + "local time = tonumber(ARGV[4]) + tonumber(retryInterval);"
+                        + "local time = tonumber(ARGV[1]) + tonumber(retryInterval);"
                         + "redis.call('zadd', KEYS[3], time, 'ff' .. ARGV[2]);"
-                    + "elseif tonumber(ARGV[5]) > 0 then "
-                        + "redis.call('set', KEYS[6], ARGV[5]);"
-                        + "local time = tonumber(ARGV[4]) + tonumber(ARGV[5]);"
+                    + "elseif tonumber(ARGV[4]) > 0 then "
+                        + "redis.call('set', KEYS[6], ARGV[4]);"
+                        + "local time = tonumber(ARGV[1]) + tonumber(ARGV[4]);"
                         + "redis.call('zadd', KEYS[3], time, 'ff' .. ARGV[2]);"
                     + "end; "
 
@@ -91,7 +82,7 @@ public class ScheduledTasksService extends TasksService {
                 + "end;"
                 + "return 0;", 
                 Arrays.<Object>asList(tasksCounterName, statusName, schedulerQueueName, schedulerChannelName, tasksName, tasksRetryIntervalName),
-                startTime, request.getId(), encode(request), System.currentTimeMillis(), tasksRetryInterval);
+                params.getStartTime(), request.getId(), encode(request), tasksRetryInterval);
     }
     
     @Override
@@ -112,8 +103,9 @@ public class ScheduledTasksService extends TasksService {
                   // remove from executor queue
                   + "if task ~= false and (removed > 0 or removedScheduled > 0) then "
                       + "if redis.call('decr', KEYS[3]) == 0 then "
-                         + "redis.call('del', KEYS[3], KEYS[7]);"
+                         + "redis.call('del', KEYS[3]);"
                          + "if redis.call('get', KEYS[4]) == ARGV[2] then "
+                            + "redis.call('del', KEYS[7]);"
                             + "redis.call('set', KEYS[4], ARGV[3]);"
                             + "redis.call('publish', KEYS[5], ARGV[3]);"
                          + "end;"
@@ -129,11 +121,21 @@ public class ScheduledTasksService extends TasksService {
     }
     
     @Override
+    protected <T extends RRemoteServiceResponse> RPromise<T> pollResultResponse(long timeout, RequestId requestId,
+            RemoteServiceRequest request) {
+        if (request.getArgs()[0].getClass() == ScheduledParameters.class) {
+            ScheduledParameters params = (ScheduledParameters) request.getArgs()[0];
+            timeout += params.getStartTime() - System.currentTimeMillis();
+        }
+        return super.pollResultResponse(timeout, requestId, request);
+    }
+    
+    
+    @Override
     protected RequestId generateRequestId() {
         if (requestId == null) {
             byte[] id = new byte[17];
-            // TODO JDK UPGRADE replace to native ThreadLocalRandom
-            PlatformDependent.threadLocalRandom().nextBytes(id);
+            ThreadLocalRandom.current().nextBytes(id);
             id[0] = 1;
             return new RequestId(id);
         }

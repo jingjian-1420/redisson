@@ -37,14 +37,20 @@ import org.redisson.api.Node.InfoSection;
 import org.redisson.api.NodeType;
 import org.redisson.api.NodesGroup;
 import org.redisson.api.RFuture;
+import org.redisson.api.RLock;
 import org.redisson.api.RMap;
+import org.redisson.api.RMapCache;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.RedisClient;
 import org.redisson.client.RedisClientConfig;
 import org.redisson.client.RedisConnection;
 import org.redisson.client.RedisConnectionException;
 import org.redisson.client.RedisOutOfMemoryException;
+import org.redisson.client.codec.BaseCodec;
 import org.redisson.client.codec.StringCodec;
+import org.redisson.client.handler.State;
+import org.redisson.client.protocol.Decoder;
+import org.redisson.client.protocol.Encoder;
 import org.redisson.client.protocol.RedisCommands;
 import org.redisson.client.protocol.Time;
 import org.redisson.cluster.ClusterNodeInfo;
@@ -52,15 +58,48 @@ import org.redisson.cluster.ClusterNodeInfo.Flag;
 import org.redisson.codec.JsonJacksonCodec;
 import org.redisson.codec.SerializationCodec;
 import org.redisson.config.Config;
+import org.redisson.config.ReadMode;
+import org.redisson.config.SubscriptionMode;
 import org.redisson.connection.CRC16;
 import org.redisson.connection.ConnectionListener;
 import org.redisson.connection.MasterSlaveConnectionManager;
 import org.redisson.connection.balancer.RandomLoadBalancer;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.util.CharsetUtil;
+import net.bytebuddy.utility.RandomString;
+
 public class RedissonTest {
 
     protected RedissonClient redisson;
     protected static RedissonClient defaultRedisson;
+    
+//    @Test
+    public void testLeak() throws InterruptedException {
+        Config config = new Config();
+        config.useSingleServer()
+              .setAddress(RedisRunner.getDefaultRedisServerBindAddressAndPort());
+
+        RedissonClient localRedisson = Redisson.create(config);
+
+        String key = RandomString.make(120);
+        for (int i = 0; i < 500; i++) {
+            RMapCache<String, String> cache = localRedisson.getMapCache("mycache");
+            RLock keyLock = cache.getLock(key);
+            keyLock.lockInterruptibly(10, TimeUnit.SECONDS);
+            try {
+                cache.get(key);
+                cache.put(key, RandomString.make(4*1024*1024), 5, TimeUnit.SECONDS);
+            } finally {
+                if (keyLock != null) {
+                    keyLock.unlock();
+                }
+            }
+        }
+        
+
+    }
     
     @Test
     public void testDecoderError() {
@@ -355,7 +394,7 @@ public class RedissonTest {
         
         Thread.sleep(15000);
         
-        latch.await();
+        assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 
         int errors = 0;
         int success = 0;
@@ -387,8 +426,165 @@ public class RedissonTest {
         slave1.stop();
         slave2.stop();
     }
+    
+    public static class SlowCodec extends BaseCodec {
 
-//    @Test
+        private final Encoder encoder = new Encoder() {
+            @Override
+            public ByteBuf encode(Object in) throws IOException {
+                ByteBuf out = ByteBufAllocator.DEFAULT.buffer();
+                out.writeCharSequence(in.toString(), CharsetUtil.UTF_8);
+                return out;
+            }
+        };
+
+        public final Decoder<Object> decoder = new Decoder<Object>() {
+            @Override
+            public Object decode(ByteBuf buf, State state) throws IOException {
+                String str = buf.toString(CharsetUtil.UTF_8);
+                buf.readerIndex(buf.readableBytes());
+                try {
+                    Thread.sleep(2500);
+                } catch (InterruptedException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+                return str;
+            }
+        };
+
+        public SlowCodec() {
+        }
+        
+        public SlowCodec(ClassLoader classLoader) {
+            this();
+        }
+
+
+        @Override
+        public Decoder<Object> getValueDecoder() {
+            return decoder;
+        }
+
+        @Override
+        public Encoder getValueEncoder() {
+            return encoder;
+        }
+
+    }
+    
+    @Test
+    public void testDecoderInExecutor() throws Exception {
+        Config config = new Config();
+        config.setCodec(new SlowCodec());
+        config.setReferenceEnabled(false);
+        config.setThreads(32);
+        config.setNettyThreads(8);
+        config.setDecodeInExecutor(true);
+        config.useSingleServer()
+            .setAddress(RedisRunner.getDefaultRedisServerBindAddressAndPort());
+        RedissonClient redisson = Redisson.create(config);
+        
+        CountDownLatch latch = new CountDownLatch(16);
+        AtomicBoolean hasErrors = new AtomicBoolean();
+        for (int i = 0; i < 16; i++) {
+            Thread t = new Thread() {
+                public void run() {
+                    for (int i = 0; i < 10; i++) {
+                        try {
+                            redisson.getBucket("123").set("1");
+                            redisson.getBucket("123").get();
+                            if (hasErrors.get()) {
+                                latch.countDown();
+                                return;
+                            }
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                            hasErrors.set(true);
+                        }
+                        
+                    }
+                    latch.countDown();
+                };
+            };
+            t.start();
+        }
+        
+        assertThat(latch.await(60, TimeUnit.SECONDS)).isTrue();
+        assertThat(hasErrors).isFalse();
+        
+        redisson.shutdown();
+    }
+
+    
+    @Test
+    public void testFailoverWithoutErrorsInCluster() throws Exception {
+        RedisRunner master1 = new RedisRunner().port(6890).randomDir().nosave();
+        RedisRunner master2 = new RedisRunner().port(6891).randomDir().nosave();
+        RedisRunner master3 = new RedisRunner().port(6892).randomDir().nosave();
+        RedisRunner slave1 = new RedisRunner().port(6900).randomDir().nosave();
+        RedisRunner slave2 = new RedisRunner().port(6901).randomDir().nosave();
+        RedisRunner slave3 = new RedisRunner().port(6902).randomDir().nosave();
+        
+        ClusterRunner clusterRunner = new ClusterRunner()
+                .addNode(master1, slave1)
+                .addNode(master2, slave2)
+                .addNode(master3, slave3);
+        ClusterProcesses process = clusterRunner.run();
+        
+        Config config = new Config();
+        config.useClusterServers()
+        .setRetryAttempts(30)
+        .setReadMode(ReadMode.MASTER)
+        .setSubscriptionMode(SubscriptionMode.MASTER)
+        .setLoadBalancer(new RandomLoadBalancer())
+        .addNodeAddress(process.getNodes().stream().findAny().get().getRedisServerAddressAndPort());
+        RedissonClient redisson = Redisson.create(config);
+       
+        RedisProcess master = process.getNodes().stream().filter(x -> x.getRedisServerPort() == master1.getPort()).findFirst().get();
+        
+        List<RFuture<?>> futures = new ArrayList<RFuture<?>>();
+
+        Set<InetSocketAddress> oldMasters = new HashSet<>();
+        Collection<ClusterNode> masterNodes = redisson.getClusterNodesGroup().getNodes(NodeType.MASTER);
+        for (ClusterNode clusterNode : masterNodes) {
+            oldMasters.add(clusterNode.getAddr());
+        }
+        
+        master.stop();
+
+        for (int j = 0; j < 2000; j++) {
+            RFuture<?> f2 = redisson.getBucket("" + j).setAsync("");
+            futures.add(f2);
+        }
+        
+        System.out.println("master " + master.getRedisServerAddressAndPort() + " has been stopped!");
+        
+        Thread.sleep(TimeUnit.SECONDS.toMillis(30));
+        
+        RedisProcess newMaster = null;
+        Collection<ClusterNode> newMasterNodes = redisson.getClusterNodesGroup().getNodes(NodeType.MASTER);
+        for (ClusterNode clusterNode : newMasterNodes) {
+            if (!oldMasters.contains(clusterNode.getAddr())) {
+                newMaster = process.getNodes().stream().filter(x -> x.getRedisServerPort() == clusterNode.getAddr().getPort()).findFirst().get();
+                break;
+            }
+        }
+        
+        assertThat(newMaster).isNotNull();
+        
+        for (RFuture<?> rFuture : futures) {
+            rFuture.awaitUninterruptibly();
+            if (!rFuture.isSuccess()) {
+                Assert.fail();
+            }
+        }
+        
+        redisson.shutdown();
+        process.shutdown();
+    }
+
+    @Test
     public void testFailoverInCluster() throws Exception {
         RedisRunner master1 = new RedisRunner().port(6890).randomDir().nosave();
         RedisRunner master2 = new RedisRunner().port(6891).randomDir().nosave();
@@ -441,38 +637,37 @@ public class RedissonTest {
         t.start();
         t.join(1000);
 
-        Set<InetSocketAddress> addresses = new HashSet<>();
+        Set<InetSocketAddress> oldMasters = new HashSet<>();
         Collection<ClusterNode> masterNodes = redisson.getClusterNodesGroup().getNodes(NodeType.MASTER);
         for (ClusterNode clusterNode : masterNodes) {
-            addresses.add(clusterNode.getAddr());
+            oldMasters.add(clusterNode.getAddr());
         }
         
         master.stop();
         System.out.println("master " + master.getRedisServerAddressAndPort() + " has been stopped!");
         
-        Thread.sleep(TimeUnit.SECONDS.toMillis(80));
+        Thread.sleep(TimeUnit.SECONDS.toMillis(90));
         
         RedisProcess newMaster = null;
         Collection<ClusterNode> newMasterNodes = redisson.getClusterNodesGroup().getNodes(NodeType.MASTER);
         for (ClusterNode clusterNode : newMasterNodes) {
-            if (!addresses.contains(clusterNode.getAddr())) {
+            if (!oldMasters.contains(clusterNode.getAddr())) {
                 newMaster = process.getNodes().stream().filter(x -> x.getRedisServerPort() == clusterNode.getAddr().getPort()).findFirst().get();
                 break;
             }
-            System.out.println("new-master: " + clusterNode.getAddr());
         }
-                
-        Thread.sleep(50000);
+        
+        assertThat(newMaster).isNotNull();
+        
+        Thread.sleep(30000);
         
         newMaster.stop();
 
         System.out.println("new master " + newMaster.getRedisServerAddressAndPort() + " has been stopped!");
         
-        Thread.sleep(TimeUnit.SECONDS.toMillis(70));
-        
-        Thread.sleep(60000);
+        Thread.sleep(TimeUnit.SECONDS.toMillis(80));
 
-        latch.await();
+        assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 
         int errors = 0;
         int success = 0;
@@ -749,20 +944,6 @@ public class RedissonTest {
         assertThat(c.toYAML()).isEqualTo(t);
     }
     
-//    @Test
-    public void testCluster() {
-        NodesGroup<ClusterNode> nodes = redisson.getClusterNodesGroup();
-        Assert.assertEquals(2, nodes.getNodes().size());
-
-        nodes.getNodes().stream().forEach((node) -> {
-            Map<String, String> params = node.info();
-            Assert.assertNotNull(params);
-            Assert.assertTrue(node.ping());
-        });
-
-        Assert.assertTrue(nodes.pingAll());
-    }
-
     @Test
     public void testNodesInCluster() throws Exception {
         RedisRunner master1 = new RedisRunner().randomPort().randomDir().nosave();
@@ -894,15 +1075,6 @@ public class RedissonTest {
     public void testClusterConnectionFail() throws InterruptedException {
         Config config = new Config();
         config.useClusterServers().addNodeAddress("redis://127.99.0.1:1111");
-        Redisson.create(config);
-
-        Thread.sleep(1500);
-    }
-
-    @Test(expected = RedisConnectionException.class)
-    public void testElasticacheConnectionFail() throws InterruptedException {
-        Config config = new Config();
-        config.useElasticacheServers().addNodeAddress("redis://127.99.0.1:1111");
         Redisson.create(config);
 
         Thread.sleep(1500);
